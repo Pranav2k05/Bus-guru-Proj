@@ -1,0 +1,20 @@
+name: bus_guru_flutter
+description: Bus Guru Flutter frontend
+publish_to: "none"
+version: 0.1.0
+environment:
+  sdk: ">=3.2.0 <4.0.0"
+dependencies:
+  flutter:
+    sdk: flutter
+  http: ^1.2.1
+  flutter_map: ^6.1.0
+  latlong2: ^0.9.1
+  qr_flutter: ^4.1.0
+  speech_to_text: ^6.6.0
+  mobile_scanner: ^3.5.7
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+flutter:
+  uses-material-design: true

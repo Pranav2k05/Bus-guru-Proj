@@ -1,5 +1,7 @@
 import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'models/models.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:http/http.dart' as http;
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
@@ -7,19 +9,47 @@ import 'package:qr_flutter/qr_flutter.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 
-void main() {
-  runApp(const BusGuruApp());
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  final prefs = await SharedPreferences.getInstance();
+  final tok = prefs.getString('token') ?? '';
+  final usr = prefs.getString('userName') ?? 'Guest';
+  runApp(BusGuruApp(initToken: tok, initUserName: usr));
 }
 
 class BusGuruApp extends StatefulWidget {
-  const BusGuruApp({super.key});
+  final String initToken;
+  final String initUserName;
+  const BusGuruApp({super.key, required this.initToken, required this.initUserName});
   @override
   State<BusGuruApp> createState() => _BusGuruAppState();
 }
 
 class _BusGuruAppState extends State<BusGuruApp> {
-  String token = '';
-  String userName = 'Guest';
+  late String token;
+  late String userName;
+
+  @override
+  void initState() {
+    super.initState();
+    token = widget.initToken;
+    userName = widget.initUserName;
+  }
+
+  Future<void> saveAuth(String t, String n) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('token', t);
+    await prefs.setString('userName', n);
+    setState(() { token = t; userName = n; });
+  }
+
+  Future<void> clearAuth() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('token');
+    await prefs.remove('userName');
+    setState(() { token = ''; userName = 'Guest'; });
+  }
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
@@ -28,20 +58,14 @@ class _BusGuruAppState extends State<BusGuruApp> {
       home: HomeShell(
         token: token,
         userName: userName,
-        onAuth: (t, n) => setState(() {
-          token = t;
-          userName = n;
-        }),
-        onLogout: () => setState(() {
-          token = '';
-          userName = 'Guest';
-        }),
+        onAuth: saveAuth,
+        onLogout: clearAuth,
       ),
     );
   }
 }
 
-const api = 'http://localhost:8001';
+const api = 'http://127.0.0.1:8000';
 
 class HomeShell extends StatefulWidget {
   final String token;
@@ -114,10 +138,10 @@ class _AuthPageState extends State<AuthPage> {
   }
   Future<void> login() async {
     setState(() => msg = '');
-    final r = await http.post(Uri.parse('$api/auth/login'), headers: {'Content-Type': 'application/json'}, body: jsonEncode({'name': 'User', 'email': liEmail.text, 'password': liPass.text}));
+    final r = await http.post(Uri.parse('$api/auth/login'), headers: {'Content-Type': 'application/json'}, body: jsonEncode({'email': liEmail.text, 'password': liPass.text}));
     if (r.statusCode == 200) {
       final j = jsonDecode(r.body);
-      widget.onAuth(j['user_email'], j['user_name']);
+      widget.onAuth(j['access_token'], j['user_name']);
       setState(() => msg = 'Login successful.');
     } else {
       setState(() => msg = 'Invalid credentials.');
@@ -214,7 +238,7 @@ class _PlanPageState extends State<PlanPage> {
   }
   Future<void> book(Bus b, int seats) async {
     if (widget.token.isEmpty) return;
-    final r = await http.post(Uri.parse('$api/book?token=${Uri.encodeComponent(widget.token)}'), headers: {'Content-Type': 'application/json'}, body: jsonEncode({'bus_id': b.id, 'seats': seats}));
+    final r = await http.post(Uri.parse('$api/book'), headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer ${widget.token}'}, body: jsonEncode({'bus_id': b.id, 'seats': seats}));
     if (r.statusCode == 200) {
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Booked')));
     } else {
@@ -320,15 +344,18 @@ class _TicketsPageState extends State<TicketsPage> {
   }
   Future<void> load() async {
     if (widget.token.isEmpty) return;
-    final r = await http.get(Uri.parse('$api/my-bookings?token=${Uri.encodeComponent(widget.token)}'));
-    if (r.statusCode == 200) {
+    final r = await http.get(Uri.parse('$api/my-bookings'), headers: {'Authorization': 'Bearer ${widget.token}'});
+    if (r.statusCode == 401) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Session expired. Please login again.')));
+    }
+    else if (r.statusCode == 200) {
       setState(() {
         tickets = (jsonDecode(r.body) as List).map((e) => Ticket.fromJson(e)).toList();
       });
     }
   }
   Future<void> validate(int id) async {
-    final r = await http.post(Uri.parse('$api/validate-ticket'), headers: {'Content-Type': 'application/json'}, body: jsonEncode({'booking_id': id}));
+    final r = await http.post(Uri.parse('$api/validate-ticket'), headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer ${widget.token}'}, body: jsonEncode({'booking_id': id}));
     if (r.statusCode == 200) {
       await load();
     }
@@ -456,7 +483,7 @@ class ScannerPage extends StatefulWidget {
 class _ScannerPageState extends State<ScannerPage> {
   String status = 'Point camera at QR';
   Future<void> validateTicket(int id) async {
-    final r = await http.post(Uri.parse('$api/validate-ticket'), headers: {'Content-Type': 'application/json'}, body: jsonEncode({'booking_id': id}));
+    final r = await http.post(Uri.parse('$api/validate-ticket'), headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer ${widget.token}'}, body: jsonEncode({'booking_id': id}));
     if (r.statusCode == 200) {
       final j = jsonDecode(r.body);
       setState(() => status = (j['message'] ?? j['status']).toString());

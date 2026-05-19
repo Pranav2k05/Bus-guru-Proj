@@ -3,7 +3,43 @@ from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey, JSON
 from sqlalchemy.orm import sessionmaker, Session, declarative_base, relationship
+
 from pydantic import BaseModel, ConfigDict
+from jose import JWTError, jwt
+from fastapi.security import OAuth2PasswordBearer
+from datetime import timedelta
+
+SECRET_KEY = "my_super_secret_key"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user
+
 from passlib.context import CryptContext
 from datetime import datetime
 from typing import List, Optional
@@ -29,6 +65,7 @@ class User(Base):
     email = Column(String, unique=True, index=True)
     name = Column(String)
     hashed_password = Column(String)
+    is_conductor = Column(Integer, default=0)
 
 class Bus(Base):
     __tablename__ = "buses"
@@ -60,6 +97,10 @@ class UserCreate(BaseModel):
     password: str
     name: str
 
+class UserLogin(BaseModel):
+    email: str
+    password: str
+
 class BusOut(BaseModel):
     id: int
     bus_name: str
@@ -86,12 +127,6 @@ class ValidationRequest(BaseModel):
     booking_id: int
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
 def detect_lang(text):
     if re.search(r'[\u0C80-\u0CFF]', text): return "kn"
@@ -105,6 +140,14 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, 
 def seed_data():
     print("\n=== [BACKEND] Startup: Creating tables and seeding buses ===")
     Base.metadata.create_all(bind=engine)
+    # Safe schema migration for is_conductor
+    try:
+        with engine.connect() as conn:
+            conn.execute("ALTER TABLE users ADD COLUMN is_conductor INTEGER DEFAULT 0")
+        print("Migrated: added is_conductor to users")
+    except Exception as e:
+        pass
+
     print("=== [BACKEND] Tables created ===")
     db = SessionLocal()
     try:
@@ -162,14 +205,15 @@ def signup(user: UserCreate, db: Session = Depends(get_db)):
     return {"message": "Success"}
 
 @app.post("/auth/login")
-def login(user_in: UserCreate, db: Session = Depends(get_db)):
+def login(user_in: UserLogin, db: Session = Depends(get_db)):
     print(f"[LOGIN] {user_in.email}")
     user = db.query(User).filter(User.email == user_in.email).first()
     if not user or not pwd_context.verify(user_in.password, user.hashed_password):
         print(f"  Failed login (not found or bad password)")
         raise HTTPException(status_code=401, detail="Invalid credentials")
     print(f"  Login OK")
-    return {"access_token": user.email, "token_type": "bearer", "user_name": user.name, "user_email": user.email}
+    token_str = create_access_token({"sub": user.email, "is_conductor": user.is_conductor})
+    return {"access_token": token_str, "token_type": "bearer", "user_name": user.name, "user_email": user.email, "is_conductor": user.is_conductor}
 
 @app.get("/buses", response_model=List[BusOut])
 def get_buses(db: Session = Depends(get_db)):
@@ -187,12 +231,12 @@ def get_stops(db: Session = Depends(get_db)):
     return sorted(list(stops))
 
 @app.post("/book")
-def book_seat(booking: BookingCreate, token: str, db: Session = Depends(get_db)):
-    print(f"[BOOKING] user={token}, bus_id={booking.bus_id}, seats={booking.seats}")
-    user = db.query(User).filter(User.email == token).first()
-    if not user: raise HTTPException(status_code=401, detail="Invalid token")
+def book_seat(booking: BookingCreate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    user = current_user
+    print(f"[BOOKING] user={user.email}, bus_id={booking.bus_id}, seats={booking.seats}")
     bus = db.query(Bus).filter(Bus.id == booking.bus_id).first()
     if not bus: raise HTTPException(status_code=404, detail="Bus not found")
+    if booking.seats <= 0: raise HTTPException(status_code=400, detail="Invalid seat count!")
     if bus.total_seats < booking.seats: raise HTTPException(status_code=400, detail="Not enough seats!")
     bus.total_seats -= booking.seats
     new_booking = Booking(user_id=user.id, bus_id=bus.id, seats_booked=booking.seats, total_price=bus.fare * booking.seats, booking_date=datetime.now().strftime("%Y-%m-%d %H:%M"))
@@ -212,11 +256,9 @@ def book_seat(booking: BookingCreate, token: str, db: Session = Depends(get_db))
     }
 
 @app.get("/my-bookings")
-def get_my_bookings(token: str, db: Session = Depends(get_db)):
-    print(f"[MY-BOOKINGS] {token}")
-    user = db.query(User).filter(User.email == token).first()
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid token")
+def get_my_bookings(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    user = current_user
+    print(f"[MY-BOOKINGS] {user.email}")
     bookings = db.query(Booking).filter(Booking.user_id == user.id).all()
     results = []
     for b in bookings:
@@ -237,7 +279,9 @@ def get_my_bookings(token: str, db: Session = Depends(get_db)):
     return results
 
 @app.post("/validate-ticket")
-def validate(req: ValidationRequest, db: Session = Depends(get_db)):
+def validate(req: ValidationRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if current_user.is_conductor != 1:
+        raise HTTPException(status_code=403, detail="Not authorized. Must be conductor.")
     print(f"[VALIDATE-TICKET] booking_id={req.booking_id}")
     booking = db.query(Booking).filter(Booking.id == req.booking_id).first()
     if not booking:
@@ -259,7 +303,12 @@ async def chat_bot(req: ChatRequest, db: Session = Depends(get_db)):
     user_name, user_email, booking_history = "Guest", "", []
     tickets_str = "No tickets booked."
     if req.token:
-        user = db.query(User).filter(User.email == req.token).first()
+        try:
+            payload = jwt.decode(req.token, SECRET_KEY, algorithms=[ALGORITHM])
+            user_email_from_token = payload.get("sub")
+            user = db.query(User).filter(User.email == user_email_from_token).first()
+        except JWTError:
+            user = None
         if user:
             user_name = user.name
             user_email = user.email
